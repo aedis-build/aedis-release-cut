@@ -1,0 +1,16 @@
+{
+  "name": "Release Cut",
+  "url": "https://github.com/aedis-build/aedis-release-cut",
+  "description": "Tags releases and opens release pull requests for Aedis Release Cut. Short-lived installation tokens, no webhook.",
+  "public": false,
+  "hook_attributes": {
+    "active": false
+  },
+  "default_permissions": {
+    "contents": "write",
+    "pull_requests": "write",
+    "metadata": "read",
+    "workflows": "write"
+  },
+  "default_events": []
+}
