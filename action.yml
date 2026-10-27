@@ -1,0 +1,211 @@
+# Release cut from Conventional Commits, run in the caller's job on every push to the default branch and on
+# workflow_dispatch (input bump). The next version comes from the commits since the last tag (scripts/next-version.sh:
+# breaking → major, feat → minor, fix/perf/refactor/revert/deps → patch, anything else → no release).
+#
+# Two repository shapes:
+# - With `version-files` (package.json whose `version` follows the release): the version is proposed in a pull request
+#   "chore(release): vX.Y.Z" that bumps those files, the exact `pin-dependency` inside them, the `version-source`
+#   (one source file with `version-source-pattern`), the `<pin-pattern>X.Y.Z` pins in versioned files (docs) and, with
+#   `lockfile-command`, the lockfile. The PR goes through the same CI and gate as any change; when it reaches the
+#   default branch this action tags that commit (`<prefix>X.Y.Z` for each of `tag-prefixes`) and the repository's
+#   release workflows take over. Nothing is proposed before the first tag exists: the first release is cut on purpose,
+#   with the bump of a manual run, and keeps the version the sources already declare when it is higher than the
+#   computed one (then there is no PR: the default branch already says that version, and it is tagged right there).
+# - Without `version-files` (the version only exists in the tag): the next tag is pushed straight on the current commit.
+#
+# Branch, PR and tags are made with the short-lived token of a GitHub App (input `token`): a tag pushed with the
+# GITHUB_TOKEN starts no workflow, and there is no long-lived token. The App must be a trusted author of the
+# repository's merge policy, never the App that reviews. Permission the caller's job needs: contents: read (the App
+# writes).
+name: Aedis Release Cut
+description: >-
+  Cuts the next semver release from Conventional Commits: tags the default branch, or proposes a release pull request
+  that bumps the version files, with a GitHub App token.
+author: Aedis
+branding:
+  icon: tag
+  color: purple
+
+inputs:
+  token:
+    description: >-
+      Installation token of the GitHub App that tags and opens the release pull request (contents: write,
+      pull-requests: write), e.g. from actions/create-github-app-token. Never the GITHUB_TOKEN: its tags start no workflow.
+    required: true
+  app-slug:
+    description: >-
+      Slug of that GitHub App (actions/create-github-app-token's app-slug output), so commits and tags carry its bot
+      user. Empty uses github-actions[bot] as the identity.
+    default: ""
+  bump:
+    description: auto (from the commits since the last tag) or patch/minor/major; any of the three also cuts the first release
+    default: auto
+  tag-prefixes:
+    description: Space-separated tag prefixes; the first names the release (git describe, PR title). E.g. "v cli-v"
+    default: v
+  version-files:
+    description: Space-separated package.json files whose `version` follows the release; the first is the current version. Empty tags directly
+    default: ""
+  pin-dependency:
+    description: Dependency that, inside version-files, is pinned exactly to the released version (e.g. "@aedis/cli")
+    default: ""
+  version-source:
+    description: Source file that declares the version (e.g. packages/cli/src/cli.ts); needs version-source-pattern
+    default: ""
+  version-source-pattern:
+    description: 'Literal text with {version} in place of the version, e.g. ''export const VERSION = "{version}";'''
+    default: ""
+  pin-pattern:
+    description: Literal prefix whose `<pin-pattern><current version>` occurrences in versioned files move to the new version (e.g. "@aedis/cli@"); lockfiles are left out
+    default: ""
+  lockfile-command:
+    description: Command that regenerates the lockfile after the bump (e.g. "pnpm install --lockfile-only"); empty for none
+    default: ""
+  node-version:
+    description: Node.js version used to read and bump the version files
+    default: "22"
+
+outputs:
+  tag:
+    description: First tag pushed by this run (empty when only a pull request was made, or there was nothing to release)
+    value: ${{ steps.tag.outputs.tag || steps.next.outputs.tag }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        token: ${{ inputs.token }}
+        persist-credentials: false
+    # pnpm only exists to regenerate the lockfile; action-setup reads the version from the repository's packageManager.
+    - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      if: contains(inputs.lockfile-command, 'pnpm')
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ inputs.node-version }}
+    - name: Git identity and credentials (the App's bot user, so commits and tags carry who made them)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        SLUG: ${{ inputs.app-slug }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::$GH_TOKEN"
+        if [ -n "$SLUG" ]; then
+          id="$(gh api "users/${SLUG}[bot]" --jq .id)"
+          git config user.name "${SLUG}[bot]"
+          git config user.email "${id}+${SLUG}[bot]@users.noreply.github.com"
+        else
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        fi
+        # The token goes in the same header actions/checkout uses, so every push below authenticates as the App and
+        # no URL ever carries it.
+        git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic $(printf '%s' "x-access-token:$GH_TOKEN" | base64 -w0)"
+        # A nested checkout (another repository under the workspace) must never reach the release commit as a gitlink
+        # without .gitmodules: every later checkout of the branch would fail. Excluded before any `git add`.
+        find . -mindepth 2 -name .git -prune -printf '%h\n' | sed 's|^\./||' >> .git/info/exclude
+
+    # A merged release PR reaches the default branch as "chore(release): <prefix>X.Y.Z": tag that commit, once.
+    - name: Tag a merged release
+      id: tag
+      if: github.event_name == 'push' && inputs.version-files != ''
+      shell: bash
+      env:
+        PREFIXES: ${{ inputs.tag-prefixes }}
+        VERSION_FILES: ${{ inputs.version-files }}
+      run: |
+        set -euo pipefail
+        read -r first _ <<< "$PREFIXES"
+        subject="$(git log -1 --format=%s)"
+        if [[ ! "$subject" =~ ^chore\(release\):\ $first([0-9]+\.[0-9]+\.[0-9]+)( |$) ]]; then exit 0; fi
+        version="${BASH_REMATCH[1]}"
+        read -r file _ <<< "$VERSION_FILES"
+        declared="$(node -p "require('./$file').version")"
+        test "$declared" = "$version" || { echo "::error::$subject but $file says $declared"; exit 1; }
+        if git ls-remote --exit-code --tags origin "refs/tags/$first$version" >/dev/null; then echo "$first$version exists"; echo "done=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+        refs=()
+        for p in $PREFIXES; do git tag -a "$p$version" -m "release $p$version"; refs+=("refs/tags/$p$version"); done
+        git push origin "${refs[@]}"
+        echo "tagged ${refs[*]#refs/tags/}"
+        echo "tag=$first$version" >> "$GITHUB_OUTPUT"
+        echo "done=true" >> "$GITHUB_OUTPUT"
+
+    - name: Propose the next release
+      id: next
+      if: steps.tag.outputs.done != 'true'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        BUMP: ${{ inputs.bump }}
+        GH_TOKEN: ${{ inputs.token }}
+        PREFIXES: ${{ inputs.tag-prefixes }}
+        VERSION_FILES: ${{ inputs.version-files }}
+        DEP: ${{ inputs.pin-dependency }}
+        SOURCE: ${{ inputs.version-source }}
+        SOURCE_PATTERN: ${{ inputs.version-source-pattern }}
+        PIN: ${{ inputs.pin-pattern }}
+        LOCKFILE: ${{ inputs.lockfile-command }}
+      run: |
+        set -euo pipefail
+        read -r first _ <<< "$PREFIXES"
+        last="$(git describe --tags --abbrev=0 --match "${first}[0-9]*.[0-9]*.[0-9]*" 2>/dev/null || true)"
+        if [ -z "$last" ] && [ "$BUMP" = auto ]; then
+          echo "no release yet: cut the first one with a manual run and an explicit bump"; exit 0
+        fi
+        range="$([ -n "$last" ] && echo "$last..HEAD" || echo HEAD)"
+        next="$(git log --format='%s%n%b' $range | bash "$ACTION_PATH/scripts/next-version.sh" --last "$last" --bump "$BUMP")"
+        [ -n "$next" ] || exit 0
+        current=""
+        if [ -n "$VERSION_FILES" ]; then
+          read -r file _ <<< "$VERSION_FILES"
+          current="$(node -p "require('./$file').version")"
+          # The first release keeps the version the sources already declare when it is higher than the computed one.
+          if [ -z "$last" ] && [ "$(printf '%s\n%s\n' "$current" "$next" | sort -V | tail -1)" = "$current" ]; then next="$current"; fi
+        fi
+        echo "${last:-no tag} → $first$next ($BUMP)"
+
+        tags=(); refs=()
+        for p in $PREFIXES; do tags+=("$p$next"); refs+=("refs/tags/$p$next"); done
+        # Without version files, or when the default branch already declares the version: the tag goes straight on HEAD.
+        if [ -z "$VERSION_FILES" ] || [ "$next" = "$current" ]; then
+          for t in "${tags[@]}"; do git tag -a "$t" -m "release $t"; done
+          git push origin "${refs[@]}"
+          echo "tagged ${tags[*]} on $GITHUB_REF_NAME"
+          echo "tag=$first$next" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+
+        NEXT="$next" CURRENT="$current" node - <<'JS'
+        const fs = require("node:fs");
+        const { NEXT, CURRENT, VERSION_FILES, DEP, SOURCE, SOURCE_PATTERN } = process.env;
+        for (const file of VERSION_FILES.split(/\s+/).filter(Boolean)) {
+          const json = JSON.parse(fs.readFileSync(file, "utf8"));
+          json.version = NEXT;
+          if (DEP && json.dependencies?.[DEP]) json.dependencies[DEP] = NEXT;
+          fs.writeFileSync(file, JSON.stringify(json, null, 2) + "\n");
+        }
+        if (SOURCE) {
+          if (!SOURCE_PATTERN.includes("{version}")) throw new Error("version-source-pattern must contain {version}");
+          const before = SOURCE_PATTERN.replace("{version}", CURRENT);
+          const text = fs.readFileSync(SOURCE, "utf8");
+          if (!text.includes(before)) throw new Error(`${SOURCE} does not contain ${JSON.stringify(before)}`);
+          fs.writeFileSync(SOURCE, text.split(before).join(SOURCE_PATTERN.replace("{version}", NEXT)));
+        }
+        JS
+        # The pinned install commands in the docs follow the release; lockfiles are left out (the command below remakes them).
+        if [ -n "$PIN" ]; then
+          git grep -lz --fixed-strings "$PIN$current" -- ':!pnpm-lock.yaml' ':!package-lock.json' ':!yarn.lock' \
+            | xargs -0 -r sed -i "s|$(printf '%s' "$PIN$current" | sed 's/[.[\*^$|]/\\&/g')|$PIN$next|g"
+        fi
+        if [ -n "$LOCKFILE" ]; then $LOCKFILE; fi
+
+        branch="release/$first$next"
+        git checkout -q -B "$branch"
+        git add -A
+        git commit -q -s -m "chore(release): $first$next" -m "$(printf 'Commits since %s:\n\n%s' "${last:-the beginning}" "$(git log --format='- %s' $range)")"
+        git push -q --force origin "HEAD:refs/heads/$branch"
+        body="$(printf 'Release pull request made by Aedis Release Cut from the Conventional Commits since %s. Merging it tags %s on the merged commit, and the release workflows of this repository take over.\n\n%s' "${last:-the beginning}" "$(printf '`%s` ' "${tags[@]}")" "$(git log --format='- %s' $range)")"
+        number="$(gh pr list --head "$branch" --base "$GITHUB_REF_NAME" --state open --json number --jq '.[0].number')"
+        if [ -n "$number" ]; then gh pr edit "$number" --title "chore(release): $first$next" --body "$body"
+        else gh pr create --head "$branch" --base "$GITHUB_REF_NAME" --title "chore(release): $first$next" --body "$body"; fi
