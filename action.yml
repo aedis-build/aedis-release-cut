@@ -13,10 +13,14 @@
 #   computed one (then there is no PR: the default branch already says that version, and it is tagged right there).
 # - Without `version-files` (the version only exists in the tag): the next tag is pushed straight on the current commit.
 #
-# Branch, PR and tags are made with the short-lived token of a GitHub App (input `token`): a tag pushed with the
-# GITHUB_TOKEN starts no workflow, and there is no long-lived token. The App must be a trusted author of the
-# repository's merge policy, never the App that reviews. Permission the caller's job needs: contents: read (the App
-# writes).
+# Branch, PR and tags are made with the token the caller passes (input `token`, default the GITHUB_TOKEN). What that
+# token may do is decided first, by scripts/mode.sh: a tag pushed with the GITHUB_TOKEN starts no workflow, so with
+# it the action runs `gh workflow run` of `dispatch-workflows` on the tag (workflow_dispatch is GitHub's exception),
+# or says the tag starts nothing; a release pull request opened with the GITHUB_TOKEN gets no pull_request events
+# (no CI, no gate), so that mode needs a GitHub App or fine-grained PAT token and fails before touching the
+# repository. With an App or PAT token the pushed tag and the pull request start everything by themselves.
+# Permissions of the caller's job: contents: read with an App or PAT token (the token writes); contents: write and
+# actions: write with the GITHUB_TOKEN.
 name: Aedis Release Cut
 description: >-
   Cuts the next semver release from Conventional Commits: tags the default branch, or proposes a release pull request
@@ -29,9 +33,16 @@ branding:
 inputs:
   token:
     description: >-
-      Installation token of the GitHub App that tags and opens the release pull request (contents: write,
-      pull-requests: write), e.g. from actions/create-github-app-token. Never the GITHUB_TOKEN: its tags start no workflow.
-    required: true
+      Token that tags and opens the release pull request: the installation token of a GitHub App (recommended,
+      e.g. from actions/create-github-app-token), a fine-grained PAT, or the GITHUB_TOKEN (default), which can only
+      tag and then needs dispatch-workflows to start the release. See "Which token" in the README.
+    default: ${{ github.token }}
+  dispatch-workflows:
+    description: >-
+      Space-separated workflow files (e.g. "release.yml cli-release.yml") run with `gh workflow run` on the new tag
+      when the token is the GITHUB_TOKEN, whose tags start no workflow. Each must accept workflow_dispatch with an
+      optional `tag` input. Ignored with an App or PAT token; empty with the GITHUB_TOKEN tags without starting anything.
+    default: ""
   app-slug:
     description: >-
       Slug of that GitHub App (actions/create-github-app-token's app-slug output), so commits and tags carry its bot
@@ -73,6 +84,21 @@ outputs:
 runs:
   using: composite
   steps:
+    # Decided before anything is checked out: a mode the token cannot serve fails here, with nothing touched.
+    - name: Which mode the token allows
+      id: mode
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        VERSION_FILES: ${{ inputs.version-files }}
+        # True when the caller passed the workflow's own token (or nothing): compared by GitHub, never printed.
+        GITHUB_TOKEN_IN_USE: ${{ inputs.token == github.token }}
+        DISPATCH: ${{ inputs.dispatch-workflows }}
+      run: |
+        set -euo pipefail
+        mode="$(bash "$ACTION_PATH/scripts/mode.sh" --version-files "$VERSION_FILES" --github-token "$GITHUB_TOKEN_IN_USE" --dispatch-workflows "$DISPATCH")"
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        echo "mode: $mode"
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-depth: 0
@@ -138,6 +164,8 @@ runs:
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
+        MODE: ${{ steps.mode.outputs.mode }}
+        DISPATCH: ${{ inputs.dispatch-workflows }}
         BUMP: ${{ inputs.bump }}
         GH_TOKEN: ${{ inputs.token }}
         PREFIXES: ${{ inputs.tag-prefixes }}
@@ -173,7 +201,17 @@ runs:
           for t in "${tags[@]}"; do git tag -a "$t" -m "release $t"; done
           git push origin "${refs[@]}"
           echo "tagged ${tags[*]} on $GITHUB_REF_NAME"
-          echo "tag=$first$next" >> "$GITHUB_OUTPUT"; exit 0
+          echo "tag=$first$next" >> "$GITHUB_OUTPUT"
+          # The GITHUB_TOKEN's tag starts no workflow: the release workflows are dispatched on it, or the summary says nothing runs.
+          case "$MODE" in
+            tag-dispatch)
+              for wf in $DISPATCH; do gh workflow run "$wf" --ref "refs/tags/$first$next" -f "tag=$first$next"; echo "dispatched $wf on $first$next"; done
+              echo "Tagged \`$first$next\` and dispatched: $DISPATCH" >> "$GITHUB_STEP_SUMMARY" ;;
+            tag-silent)
+              echo "::warning::$first$next was tagged with the GITHUB_TOKEN, which starts no workflow; set dispatch-workflows or pass an App token"
+              echo "Tagged \`$first$next\` with the GITHUB_TOKEN: **no workflow starts on this tag**. Set \`dispatch-workflows\` or pass a GitHub App token." >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+          exit 0
         fi
 
         NEXT="$next" CURRENT="$current" node - <<'JS'

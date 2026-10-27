@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Create the Release Cut GitHub App</title>
+</head>
+<body>
+  <h1>Create the Release Cut GitHub App</h1>
+  <p>Posts <code>app-manifest.json</code> to GitHub's App Manifest endpoint; GitHub shows the App for you to confirm and then hands you its id and private key. Leave the organization empty for a personal account.</p>
+  <form id="f" method="post">
+    <label>Organization <input id="org" name="org_ignored" placeholder="aedis-build"></label>
+    <input type="hidden" name="manifest" id="manifest">
+    <button type="submit">Create the App on GitHub</button>
+  </form>
+  <script>
+    const manifest = {
+      name: "Release Cut",
+      url: "https://github.com/aedis-build/aedis-release-cut",
+      description: "Tags releases and opens release pull requests for Aedis Release Cut. Short-lived installation tokens, no webhook.",
+      public: false,
+      hook_attributes: { active: false },
+      default_permissions: { contents: "write", pull_requests: "write", metadata: "read", workflows: "write" },
+      default_events: []
+    };
+    document.getElementById("f").addEventListener("submit", () => {
+      const org = document.getElementById("org").value.trim();
+      document.getElementById("f").action = org
+        ? `https://github.com/organizations/${encodeURIComponent(org)}/settings/apps/new`
+        : "https://github.com/settings/apps/new";
+      document.getElementById("manifest").value = JSON.stringify(manifest);
+    });
+  </script>
+</body>
+</html>

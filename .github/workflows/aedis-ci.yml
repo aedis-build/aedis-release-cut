@@ -42,4 +42,5 @@ jobs:
           persist-credentials: false
       - run: bash scripts/next-version.sh --self-test
       - run: bash scripts/check-conventional-commits.sh --self-test
+      - run: bash scripts/mode.sh --self-test
       - run: pipx run reuse==5.0.2 lint
