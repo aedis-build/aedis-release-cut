@@ -22,9 +22,7 @@
 # Permissions of the caller's job: contents: read with an App or PAT token (the token writes); contents: write and
 # actions: write with the GITHUB_TOKEN.
 name: Aedis Release Cut
-description: >-
-  Cuts the next semver release from Conventional Commits: tags the default branch, or proposes a release pull request
-  that bumps the version files, with a GitHub App token.
+description: Cuts the next semver release from Conventional Commits: tags the default branch or opens a release pull request.
 author: Aedis
 branding:
   icon: tag
