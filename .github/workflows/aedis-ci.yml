@@ -40,6 +40,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The runner refuses an action.yml it cannot parse, and that only shows up in the callers: check it here.
+      - run: python3 -c "import yaml; d = yaml.safe_load(open('action.yml')); assert d['name'] and len(d['description']) < 125, d['description']"
       - run: bash scripts/next-version.sh --self-test
       - run: bash scripts/check-conventional-commits.sh --self-test
       - run: bash scripts/mode.sh --self-test
